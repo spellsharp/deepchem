@@ -11,6 +11,10 @@ except ModuleNotFoundError:
     has_torch = False
     pass
 
+# Inputs and parameters used while training the tensorflow model to obtain weights.
+n_tasks_tf = 3
+n_features_tf = 100
+layer_sizes_tf = [512, 1024]
 
 @pytest.mark.torch
 def test_robustmultitask_construction():
@@ -33,12 +37,12 @@ def test_robustmultitask_forward():
     and that the output has the correct value.
     """
 
-    n_tasks = 1
-    n_features = 100
-
+    n_tasks = n_tasks_tf
+    n_features = n_features_tf
+    layer_sizes = layer_sizes_tf
     torch_model = RobustMultitask(n_tasks=n_tasks,
                                   n_features=n_features,
-                                  layer_sizes=[1024],
+                                  layer_sizes=layer_sizes,
                                   mode='classification')
 
     weights = np.load(
@@ -55,7 +59,6 @@ def test_robustmultitask_forward():
     assert np.allclose(output, torch_out,
                        atol=1e-4), "Predictions are not close"
 
-
 def move_weights(torch_model, weights):
     """Porting weights from Tensorflow to PyTorch"""
 
@@ -68,17 +71,18 @@ def move_weights(torch_model, weights):
         k: to_torch_param(v) for k, v in weights.items() if k != "output"
     }
 
-    # Shared layers
+    # Shared layers (512, 1024)
     torch_model.shared_layers[0].weight = torch_weights["shared-layers-dense-w"]
     torch_model.shared_layers[0].bias = torch_weights["shared-layers-dense-b"]
 
-    # Task 0 - We have only one task.
-    # Bypass layer
-    torch_model.bypass_layers[0][0].weight = torch_weights[
-        "bypass-layers-dense_1-w"]
-    torch_model.bypass_layers[0][0].bias = torch_weights[
-        "bypass-layers-dense_1-b"]
-    # Output layer
-    torch_model.output_layers[0].weight = torch_weights[
-        'bypass-layers-dense_2-w']
-    torch_model.output_layers[0].bias = torch_weights['bypass-layers-dense_2-b']
+    torch_model.shared_layers[3].weight = torch_weights["shared-layers-dense_1-w"]
+    torch_model.shared_layers[3].bias = torch_weights["shared-layers-dense_1-b"]
+
+    # Bypass layers for tasks
+    for i in range(3):  # Three tasks
+        torch_model.bypass_layers[i][0].weight = torch_weights[f"bypass-layers-dense_{2 + i * 2}-w"]
+        torch_model.bypass_layers[i][0].bias = torch_weights[f"bypass-layers-dense_{2 + i * 2}-b"]
+
+        # Output layers for each task
+        torch_model.output_layers[i].weight = torch_weights[f"bypass-layers-dense_{3 + i * 2}-w"]
+        torch_model.output_layers[i].bias = torch_weights[f"bypass-layers-dense_{3 + i * 2}-b"]

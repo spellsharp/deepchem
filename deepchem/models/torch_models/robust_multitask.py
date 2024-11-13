@@ -190,7 +190,7 @@ class RobustMultitask(nn.Module):
             This is only returned when self.mode = `classification`, the output consists of the
             logits for classes before softmax.
         """
-        task_outputs: List[torch.Tensor] = []
+        task_outputs: List[torch.Tensor] = []        
 
         # Shared layers
         shared_output = self.shared_layers(x)
@@ -276,7 +276,7 @@ class RobustMultitaskRegressor(TorchModel):
                  weight_decay_penalty: float = 0.0,
                  weight_decay_penalty_type: str = "l2",
                  dropouts: OneOrMany[float] = 0.5,
-                 activation_fns: OneOrMany[ActivationFn] = 'relu',
+                 activation_fns: OneOrMany[ActivationFn] = nn.ReLU(),
                  bypass_layer_sizes=[100],
                  bypass_weight_init_stddevs=[.02],
                  bypass_bias_init_consts=[1.0],
@@ -307,6 +307,8 @@ class RobustMultitaskRegressor(TorchModel):
         self.shared_layers = model.shared_layers
         self.bypass_layers = model.bypass_layers
         self.output_layers = model.output_layers
+
+        print(model)
 
         super(RobustMultitaskRegressor,
               self).__init__(model,

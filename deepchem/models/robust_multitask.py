@@ -169,6 +169,8 @@ class RobustMultitaskClassifier(KerasModel):
         logits = Stack(axis=1)(task_outputs)
         output = tf.keras.layers.Softmax()(logits)
         model = tf.keras.Model(inputs=mol_features, outputs=[output, logits])
+        self.layers = model.layers
+        model.summary()
         super(RobustMultitaskClassifier,
               self).__init__(model,
                              SoftmaxCrossEntropy(),
@@ -355,6 +357,8 @@ class RobustMultitaskRegressor(KerasModel):
 
         outputs = Stack(axis=1)(task_outputs)
         model = tf.keras.Model(inputs=mol_features, outputs=outputs)
+        self.layers = model.layers
+        model.summary()
         super(RobustMultitaskRegressor,
               self).__init__(model,
                              L2Loss(),
