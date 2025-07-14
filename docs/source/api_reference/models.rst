@@ -646,6 +646,12 @@ HNN
 .. autoclass:: deepchem.models.torch_models.HNN
   :members:
 
+FNOModel
+----------
+
+.. autoclass:: deepchem.models.torch_models.FNOModel
+  :members:
+
 PyTorch Lightning Models
 ========================
 
