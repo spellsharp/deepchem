@@ -1,8 +1,11 @@
-from deepchem.models.torch_models.layers import SpectralConv
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Union, Tuple
+from deepchem.models.torch_models.layers import SpectralConv
+from deepchem.models.torch_models import TorchModel
+from typing import Union, Tuple, Optional, List
+import numpy as np
+from deepchem.utils.fno_utils import UnitGaussianNormalizer
 
 
 class FNOBlock(nn.Module):
@@ -83,3 +86,405 @@ class FNOBlock(nn.Module):
         x1 = self.spectral_conv(x)
         x2 = self.w(x)
         return F.relu(x1 + x2)
+
+
+class FNOBase(nn.Module):
+    """Base implementation of Fourier Neural Operator.
+
+    Fourier Neural Operator (FNO) is a neural network architecture for learning
+    mappings between function spaces. It uses spectral convolutions in Fourier
+    space to capture global dependencies efficiently, making it particularly
+    effective for solving partial differential equations (PDEs).
+
+    The architecture consists of:
+    1. Lifting layer (fc0): Maps input to higher-dimensional representation
+    2. Multiple FNO blocks: Perform spectral and local convolutions
+    3. Projection layers (fc1, fc2): Map back to output space
+
+    References
+    ----------
+    This technique was introduced in Li, Zongyi, et al. "Fourier neural operator for parametric partial differential equations." arXiv preprint arXiv:2010.08895 (2020).
+
+    Example
+    -------------
+    >>> import torch
+    >>> from deepchem.models.torch_models.fno import FNOBase
+    >>> model = FNOBase(in_channels=1, out_channels=1, modes=8, width=32, dims=2)
+    >>> x = torch.randn(1, 16, 16, 1)
+    >>> output = model(x)
+    """
+
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 modes: Union[int, Tuple[int, ...]],
+                 width: int,
+                 dims: int,
+                 depth: int = 4,
+                 positional_encoding: bool = False,
+                 normalize_input: bool = True,
+                 normalize_output: bool = True,
+                 normalization_dims: Optional[List[int]] = None) -> None:
+        """Initialize the FNO base model.
+        Parameters
+        ----------
+        in_channels: int
+            Dimension of input features
+        out_channels: int
+            Dimension of output features
+        modes: int or tuple
+            Number of Fourier modes to keep in spectral convolution
+        width: int
+            Width of the hidden layers
+        dims: int
+            Spatial dimensionality (1, 2, or 3)
+        depth: int, default 4
+            Number of FNO blocks to stack
+        positional_encoding: bool, default False
+            When enabled, uses meshgrids as positional encodings
+        normalize_input: bool, default True
+            When enabled, normalizes input data
+        normalize_output: bool, default True
+            When enabled, normalizes output data
+        normalization_dims: List[int], optional
+            Dimensions to normalize over. If None, defaults to batch + spatial dimensions, preserving channels.
+        """
+        super().__init__()
+        self.dims = dims
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.width = width
+        self.positional_encoding = positional_encoding
+        self.normalize_input = normalize_input
+        self.normalize_output = normalize_output
+
+        # Account for additional channels when positional encoding is enabled
+        self.actual_in_channels = in_channels + dims if positional_encoding else in_channels
+
+        # Default normalization dimensions: batch + spatial dimensions, preserve channels
+        if normalization_dims is None:
+            self.normalization_dims = [0] + list(range(2, dims + 2))
+        else:
+            self.normalization_dims = normalization_dims
+
+        # Initialize normalizers
+        self.input_normalizer = UnitGaussianNormalizer(
+            dim=self.normalization_dims) if normalize_input else None
+        self.output_normalizer = UnitGaussianNormalizer(
+            dim=self.normalization_dims) if normalize_output else None
+
+        # Model architecture
+        self.lifting = nn.Sequential(
+            nn.Linear(self.actual_in_channels, 2 * width), nn.GELU(),
+            nn.Linear(2 * width, width))
+
+        self.fno_blocks = nn.Sequential(
+            *[FNOBlock(width, modes, dims=dims) for _ in range(depth)])
+
+        self.projection = nn.Sequential(nn.Linear(width, 2 * width), nn.GELU(),
+                                        nn.Linear(2 * width, out_channels))
+
+    def fit_normalizers(self,
+                        x_train: torch.Tensor,
+                        y_train: Optional[torch.Tensor] = None) -> None:
+        """Fit normalizers on training data."""
+        if self.normalize_input and self.input_normalizer:
+            self.input_normalizer.fit(x_train)
+        if self.normalize_output and self.output_normalizer and y_train is not None:
+            self.output_normalizer.fit(y_train)
+
+    def set_normalizers_device(self, device: torch.device) -> None:
+        """Move normalizers to specified device."""
+        if self.input_normalizer:
+            self.input_normalizer.to(device)
+        if self.output_normalizer:
+            self.output_normalizer.to(device)
+
+    def _ensure_channel_first(self, x: torch.Tensor) -> torch.Tensor:
+        """Ensure input tensor has channels in the correct position."""
+        in_ch = self.in_channels
+        if x.shape[-1] == in_ch:
+            perm = (0, -1) + tuple(range(1, self.dims + 1))
+            return x.permute(*perm).contiguous()
+        elif x.shape[1] == in_ch:
+            return x
+        else:
+            raise ValueError(
+                f"Expected either (batch, {in_ch}, *spatial_dims) or "
+                f"(batch, *spatial_dims, {in_ch}), got {tuple(x.shape)}")
+
+    def _apply_input_normalization(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply input normalization if enabled."""
+        if self.normalize_input and self.input_normalizer and self.input_normalizer.fitted:
+            return self.input_normalizer.transform(x)
+        return x
+
+    def _apply_output_normalization(self, y: torch.Tensor) -> torch.Tensor:
+        """Apply output normalization during training if enabled."""
+        if self.normalize_output and self.output_normalizer and self.output_normalizer.fitted and self.training:
+            return self.output_normalizer.transform(y)
+        return y
+
+    def _apply_output_denormalization(self, y: torch.Tensor) -> torch.Tensor:
+        """Apply output denormalization during evaluation if enabled."""
+        if self.normalize_output and self.output_normalizer and self.output_normalizer.fitted and not self.training:
+            return self.output_normalizer.inverse_transform(y)
+        return y
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the FNO model with integrated normalization."""
+        if x.ndim != self.dims + 2:
+            raise ValueError(
+                f"Expected tensor with {self.dims + 2} dims (batch, *spatial_dims, in_channels), got {x.ndim}"
+            )
+
+        # Ensure channels are in the correct position
+        x = self._ensure_channel_first(x)
+
+        # Positional encoding via meshgrid
+        if self.positional_encoding:
+            batch_size = x.shape[0]
+            spatial = x.shape[2:]
+            coords = [
+                torch.linspace(0, 1, steps=s, device=x.device) for s in spatial
+            ]
+            mesh = torch.meshgrid(*coords, indexing='ij')
+            grid = torch.stack(mesh, dim=0)  # shape (dims, *spatial)
+            grid = grid.unsqueeze(0).repeat(batch_size, 1, *([1] * self.dims))
+            x = torch.cat([x, grid], dim=1)
+
+        # Apply input normalization
+        x = self._apply_input_normalization(x)
+
+        # Lifting: permute channels to last dim, apply lifting, permute back
+        perm_lifting = (0, *range(2, x.ndim), 1)
+        x = x.permute(*perm_lifting).contiguous()
+        x = self.lifting(x)
+
+        # FNO blocks: permute channels to second dim
+        perm_back = (0, x.ndim - 1) + tuple(range(1, x.ndim - 1))
+        x = x.permute(*perm_back).contiguous()
+        x = self.fno_blocks(x)
+
+        # Projection: permute channels to last dim, apply projection
+        perm_proj = (0, *range(2, x.ndim), 1)
+        x = x.permute(*perm_proj).contiguous()
+        x = self.projection(x)
+
+        # Convert back to channels-first format to match expected output format
+        x = x.permute(0, -1, *range(1, x.ndim - 1)).contiguous()
+
+        # Apply output normalization during training
+        x = self._apply_output_normalization(x)
+
+        # Apply output denormalization during evaluation
+        x = self._apply_output_denormalization(x)
+
+        return x
+
+    def normalize_targets(self, y: torch.Tensor) -> torch.Tensor:
+        """Normalize target/label data for loss computation during training."""
+        return self._apply_output_normalization(y)
+
+    def state_dict(self):
+        """Override state_dict to include normalizer statistics."""
+        state = super().state_dict()
+
+        # Save normalizer states
+        if self.input_normalizer:
+            state['input_normalizer_mean'] = self.input_normalizer.mean
+            state['input_normalizer_std'] = self.input_normalizer.std
+            state['input_normalizer_fitted'] = self.input_normalizer.fitted
+
+        if self.output_normalizer:
+            state['output_normalizer_mean'] = self.output_normalizer.mean
+            state['output_normalizer_std'] = self.output_normalizer.std
+            state['output_normalizer_fitted'] = self.output_normalizer.fitted
+
+        return state
+
+    def load_state_dict(self, state_dict, strict=True):
+        """Override load_state_dict to restore normalizer statistics."""
+        # Extract normalizer states
+        input_normalizer_mean = state_dict.pop('input_normalizer_mean', None)
+        input_normalizer_std = state_dict.pop('input_normalizer_std', None)
+        input_normalizer_fitted = state_dict.pop('input_normalizer_fitted',
+                                                 False)
+
+        output_normalizer_mean = state_dict.pop('output_normalizer_mean', None)
+        output_normalizer_std = state_dict.pop('output_normalizer_std', None)
+        output_normalizer_fitted = state_dict.pop('output_normalizer_fitted',
+                                                  False)
+
+        # Load model parameters
+        super().load_state_dict(state_dict, strict)
+
+        # Restore normalizer states
+        if self.input_normalizer and input_normalizer_mean is not None:
+            self.input_normalizer.mean = input_normalizer_mean
+            self.input_normalizer.std = input_normalizer_std
+            self.input_normalizer.fitted = input_normalizer_fitted
+
+        if self.output_normalizer and output_normalizer_mean is not None:
+            self.output_normalizer.mean = output_normalizer_mean
+            self.output_normalizer.std = output_normalizer_std
+            self.output_normalizer.fitted = output_normalizer_fitted
+
+
+class FNOModel(TorchModel):
+    """Fourier Neural Operator for learning mappings between function spaces.
+
+    This is a TorchModel wrapper around FNOBase that provides the DeepChem
+    interface for training and prediction. FNO is particularly effective for
+    solving partial differential equations (PDEs) and learning operators
+    between infinite-dimensional function spaces.
+
+    The model uses spectral convolutions in Fourier space to capture global
+    dependencies efficiently, making it much more parameter-efficient than
+    traditional convolutional neural networks for PDE solving tasks.
+
+    References
+    ----------
+    This technique was introduced in Li, Zongyi, et al. "Fourier neural operator for parametric partial differential equations." arXiv preprint arXiv:2010.08895 (2020).
+
+    Example
+    -------------
+    >>> import torch
+    >>> import deepchem as dc
+    >>> from deepchem.models.torch_models.fno import FNOModel
+    >>> x = torch.randn(1, 16, 16, 1)
+    >>> dataset = dc.data.NumpyDataset(X=x, y=x)
+    >>> model = FNOModel(in_channels=1, out_channels=1, modes=8, width=32, dims=2)
+    >>> model.fit(dataset)
+    >>> predictions = model.predict(dataset)
+    """
+
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 modes: Union[int, Tuple[int, ...]],
+                 width: int,
+                 dims: int,
+                 depth: int = 4,
+                 positional_encoding: bool = False,
+                 normalize_input: bool = True,
+                 normalize_output: bool = True,
+                 normalization_dims: Optional[List[int]] = None,
+                 **kwargs) -> None:
+        """Initialize the FNO model.
+        Parameters
+        ----------
+        in_channels: int
+            Dimension of input features at each spatial location
+        out_channels: int
+            Dimension of output features at each spatial location
+        modes: int or tuple
+            Number of Fourier modes to keep in spectral convolution. Higher values
+            capture more high-frequency information but increase computational cost
+        width: int
+            Width of the hidden layers in the FNO blocks. Controls model capacity
+        dims: int
+            Spatial dimensionality of the input data (1, 2, or 3)
+        depth: int, default 4
+            Number of FNO blocks to stack. More blocks can learn more complex mappings
+        positional_encoding: bool, default False
+            When enabled, uses meshgrids as positional encodings
+        normalize_input: bool, default True
+            When enabled, normalizes input data
+        normalize_output: bool, default True
+            When enabled, normalizes output data
+        normalization_dims: List[int], optional
+            Dimensions to normalize over. If None, defaults to batch + spatial dimensions, preserving channels.
+        **kwargs: dict
+            Additional arguments passed to TorchModel constructor
+        """
+
+        model = FNOBase(in_channels, out_channels, modes, width, dims, depth,
+                        positional_encoding, normalize_input, normalize_output,
+                        normalization_dims)
+
+        self._normalize_input = normalize_input
+        self._normalize_output = normalize_output
+        self._normalizers_fitted = False
+
+        super(FNOModel, self).__init__(model=model,
+                                       loss=self._loss_fn,
+                                       **kwargs)
+
+    def fit(self, dataset, epochs=1, **kwargs):
+        """Fit the model with automatic normalizer fitting."""
+        if (self._normalize_input or
+                self._normalize_output) and not self._normalizers_fitted:
+            self._fit_normalizers_from_dataset(dataset)
+            self._normalizers_fitted = True
+
+        nb_epoch = kwargs.pop('nb_epoch', epochs)
+        return super().fit(dataset, nb_epoch=nb_epoch, **kwargs)
+
+    def _fit_normalizers_from_dataset(self, dataset):
+        """Extract data from dataset and fit normalizers."""
+
+        X_all = torch.tensor(dataset.X, dtype=torch.float32)
+        y_all = torch.tensor(dataset.y, dtype=torch.float32)
+        self.model.fit_normalizers(X_all, y_all)
+        self.model.set_normalizers_device(self.device)
+
+    def _loss_fn(self,
+                 outputs: List[torch.Tensor],
+                 labels: List[torch.Tensor],
+                 weights: Optional[List[torch.Tensor]] = None) -> torch.Tensor:
+        """Compute the loss for training."""
+        labels_tensor: torch.Tensor = labels[0]
+        outputs_tensor: torch.Tensor = outputs[0]
+
+        # Ensure both tensors have the same shape format
+        # Convert outputs from channels-last to channels-first to match labels
+        if outputs_tensor.shape != labels_tensor.shape:
+            if outputs_tensor.ndim == labels_tensor.ndim and outputs_tensor.shape[
+                    -1] == labels_tensor.shape[1]:
+                outputs_tensor = outputs_tensor.permute(
+                    0, -1, *range(1, outputs_tensor.ndim - 1)).contiguous()
+
+        if self._normalizers_fitted:
+            labels_tensor = self.model.normalize_targets(labels_tensor)
+
+        loss = nn.MSELoss()(outputs_tensor, labels_tensor)
+        return loss
+
+    def predict(self, dataset, transformers=[], batch_size=None):
+        """Predict on dataset with proper normalization handling."""
+        was_training = self.model.training
+        self.model.eval()
+
+        try:
+            # Use a default batch size if none provided
+            if batch_size is None:
+                batch_size = 32  # Adjust this based on your GPU memory
+
+            # Get all predictions
+            predictions = []
+
+            # Convert dataset to appropriate format
+            if hasattr(dataset, 'X'):
+                X = dataset.X
+            else:
+                X = dataset
+
+            # Convert to torch tensor
+            if not isinstance(X, torch.Tensor):
+                X = torch.tensor(X, dtype=torch.float32, device=self.device)
+            elif X.device != self.device:
+                X = X.to(self.device)
+
+            # Process in batches
+            for i in range(0, len(X), batch_size):
+                batch = X[i:i + batch_size]
+                with torch.no_grad():
+                    batch_pred = self.model(batch)
+                predictions.append(batch_pred.cpu().numpy())
+
+            return np.concatenate(predictions, axis=0)
+
+        finally:
+            if was_training:
+                self.model.train()

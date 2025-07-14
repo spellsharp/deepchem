@@ -137,6 +137,8 @@ from deepchem.utils.poly_wd_graph_utils import tag_atoms_in_repeating_unit
 from deepchem.utils.poly_wd_graph_utils import onek_encoding_unk
 from deepchem.utils.poly_wd_graph_utils import remove_wildcard_atoms
 
+from deepchem.utils.fno_utils import UnitGaussianNormalizer
+
 # Polymer Weighted Directed Graph Featurization Utilities
 from deepchem.utils.poly_wd_graph_utils import PolyWDGStringValidator
 
