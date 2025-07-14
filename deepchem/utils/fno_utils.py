@@ -1,10 +1,12 @@
 import torch
 from typing import Optional, List
 
+
 class UnitGaussianNormalizer:
     """Normalizes data to zero mean and unit standard deviation."""
 
-    def __init__(self, mean: Optional[torch.Tensor] = None,
+    def __init__(self,
+                 mean: Optional[torch.Tensor] = None,
                  std: Optional[torch.Tensor] = None,
                  eps: float = 1e-7,
                  dim: Optional[List[int]] = None):
@@ -79,5 +81,14 @@ class UnitGaussianNormalizer:
             Denormalized data
         """
         if not self.fitted:
-            raise ValueError("Normalizer must be fitted before inverse_transform")
+            raise ValueError(
+                "Normalizer must be fitted before inverse_transform")
         return data * (self.std + self.eps) + self.mean
+
+    def to(self, device: torch.device) -> 'UnitGaussianNormalizer':
+        """Move normalizer to device."""
+        if self.mean is not None:
+            self.mean = self.mean.to(device)
+        if self.std is not None:
+            self.std = self.std.to(device)
+        return self
